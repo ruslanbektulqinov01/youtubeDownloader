@@ -7,10 +7,13 @@ from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, html
+from aiogram.client.default import DefaultBotProperties
 from aiogram.client.telegram import TelegramAPIServer
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message, InputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, FSInputFile
+from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,14 +22,16 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
-API_ID = os.getenv('API_ID')
-API_HASH = os.getenv('API_HASH')
-LOCAL_API_URL = os.getenv('LOCAL_API_URL', 'http://localhost:8081')
 
-# Initialize bot with local server
-local_server = TelegramAPIServer.from_base(LOCAL_API_URL)
-bot = Bot(TOKEN, server=local_server)
+session = AiohttpSession(
+    api=TelegramAPIServer.from_base('http://localhost:8081')
+)
+LOCAL_API_URL = 'http://localhost:8081/bot'
+
+logging.basicConfig(level=logging.INFO)
+
 dp = Dispatcher()
+bot = Bot(token=TOKEN, base_url=LOCAL_API_URL,session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 # Output directory for downloads
 OUTPUT_PATH = "downloads"
@@ -65,25 +70,13 @@ def format_size(bytes: int) -> str:
     return f"{bytes:.1f} GB"
 
 
-def create_format_button(format_info: dict) -> str:
-    """Create format button text"""
-    format_id = format_info.get('format_id', 'N/A')
-    ext = format_info.get('ext', 'N/A')
-    resolution = format_info.get('resolution', 'N/A')
-    filesize = format_info.get('filesize', 0)
-    filesize_str = format_size(filesize) if filesize else 'N/A'
-    has_audio = "🔊" if format_info.get('acodec') != 'none' else "🔇"
-
-    return f"{resolution} ({ext}) {has_audio} - {filesize_str}"
-
-
 class VideoDownloader:
     def __init__(self, url: str, output_path: str = OUTPUT_PATH):
         self.url = url
         self.output_path = output_path
         self.title = None
         self.video_id = None
-        self.formats = None
+        self.best_format = None
         self.ydl_opts = {
             'noplaylist': True,
             'quiet': True,
@@ -102,7 +95,6 @@ class VideoDownloader:
             logger.debug('Download completed')
 
     async def get_video_info(self) -> Tuple[bool, str, Optional[dict]]:
-        """Get video information and available formats"""
         try:
             self.video_id = extract_video_id(self.url)
             if not self.video_id:
@@ -112,39 +104,32 @@ class VideoDownloader:
                 info = ydl.extract_info(self.url, download=False)
                 self.title = info.get('title')
 
-                # Filter and sort formats
-                formats = []
-                seen_resolutions = set()
+                # Select a mid-range resolution format (720p preferred, fall back if not available)
+                self.best_format = next((f for f in info.get('formats', [])
+                                         if f.get('resolution') == '720p'
+                                         and f.get('vcodec') != 'none'
+                                         and f.get('acodec') != 'none'), None)
 
-                for f in info.get('formats', []):
-                    if f.get('vcodec') == 'none' or f.get('acodec') == 'none':
-                        continue
+                if not self.best_format:
+                    # Fall back to other available formats if 720p is not found
+                    self.best_format = next((f for f in info.get('formats', [])
+                                             if f.get('vcodec') != 'none'
+                                             and f.get('acodec') != 'none'), None)
 
-                    resolution = f.get('resolution', 'N/A')
-                    format_id = f.get('format_id', 'N/A')
-
-                    format_key = f"{resolution}_{f.get('ext', '')}"
-
-                    if format_key in seen_resolutions:
-                        continue
-
-                    seen_resolutions.add(format_key)
-                    formats.append(f)
-
-                formats.sort(key=lambda x: (x.get('height', 0) or 0), reverse=True)
-                self.formats = formats
-
-                return True, "", {'title': self.title, 'formats': formats, 'url': self.url}
+                return True, "", {'title': self.title, 'url': self.url}
 
         except Exception as e:
             logger.error(f"Error getting video info: {e}")
             return False, f"Video ma'lumotlarini olishda xatolik: {str(e)}", None
 
-    async def download(self, format_id: str) -> Tuple[bool, str, Optional[str]]:
-        """Download the video in specified format"""
+    async def download(self) -> Tuple[bool, str, Optional[str]]:
+        """Download the video in the selected best format"""
         try:
+            if not self.best_format:
+                return False, "Eng yaxshi format topilmadi", None
+
             self.ydl_opts.update({
-                'format': f'{format_id}+bestaudio[ext=m4a]/best',
+                'format': f'{self.best_format.get("format_id", "best")}',
                 'postprocessors': [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}],
             })
 
@@ -172,60 +157,6 @@ async def command_start_handler(message: Message) -> None:
                          "YouTube video havolasini yuboring.")
 
 
-def create_format_keyboard(formats: List[dict], video_id: str) -> InlineKeyboardMarkup:
-    """Create keyboard with format selection buttons"""
-    keyboard = []
-    for fmt in formats:
-        format_id = fmt.get('format_id', 'N/A')
-        button_text = create_format_button(fmt)
-        keyboard.append([InlineKeyboardButton(text=button_text, callback_data=f"format_{video_id}_{format_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-
-@dp.callback_query(lambda c: c.data.startswith('format_'))
-async def process_format_selection(callback_query: CallbackQuery):
-    try:
-        _, video_id, format_id = callback_query.data.split('_')
-
-        if video_id not in video_info_cache:
-            await callback_query.answer("Xatolik: Video ma'lumotlari topilmadi!")
-            return
-
-        video_info = video_info_cache[video_id]
-        await callback_query.message.edit_text("⏳ Video yuklab olinmoqda...")
-
-        downloader = VideoDownloader(video_info['url'])
-        success, message_text, file_path = await downloader.download(format_id)
-
-        if not success or not file_path:
-            await callback_query.message.edit_text(f"❌ Xatolik: {message_text}")
-            return
-
-        try:
-            await callback_query.message.edit_text("📤 Telegram'ga yuklanmoqda...")
-
-            # Use FSInputFile for direct upload from local server
-            video = FSInputFile(file_path)
-            await bot.send_video(
-                chat_id=callback_query.message.chat.id,
-                video=video,
-                caption=f"📹 {video_info['title']}",
-            )
-
-            await callback_query.message.delete()
-
-        except Exception as e:
-            error_message = f"Video yuborishda xatolik: {str(e)}"
-            logger.error(f"Error sending video: {str(e)}")
-            await callback_query.message.edit_text(f"❌ {error_message}")
-        finally:
-            os.remove(file_path)  # Clean up the file
-    except Exception as e:
-        error_message = f"❌ Kutilmagan xatolik: {str(e)}"
-        logger.error(f"Unexpected error: {str(e)}")
-        await callback_query.message.edit_text(error_message)
-
-
 @dp.message(lambda message: message.text and "youtu" in message.text)
 async def handle_youtube_url(message: Message):
     url = message.text.strip()
@@ -246,11 +177,39 @@ async def handle_youtube_url(message: Message):
 
     video_info_cache[video_id] = video_info
 
-    format_keyboard = create_format_keyboard(video_info['formats'], video_id)
-    await message.answer(f"📹 {video_info['title']}\nFormatni tanlang:", reply_markup=format_keyboard)
+    await message.answer(f"📹 {video_info['title']}\n⏳ Video yuklab olinmoqda...")
+
+    # Automatically download the best format
+    success, message_text, file_path = await downloader.download()
+
+    if not success or not file_path:
+        await message.answer(f"❌ Xatolik: {message_text}")
+        return
+
+    try:
+        await message.answer("📤 Telegram'ga yuklanmoqda...")
+
+        # Use FSInputFile for direct upload from local server
+        video = FSInputFile(file_path)
+        await bot.send_video(
+            chat_id=message.chat.id,
+            video=video,
+            caption=f"📹 {video_info['title']}",
+        )
+
+    except Exception as e:
+        error_message = f"Video yuborishda xatolik: {str(e)}"
+        logger.error(f"Error sending video: {str(e)}")
+        await message.answer(f"❌ {error_message}")
+    finally:
+        os.remove(file_path)  # Clean up the file
 
 
 async def main():
+    # result:bool = await bot.log_out()
+    # print(result)
+    # result = await bot.close()
+    # print(result)
     try:
         await dp.start_polling(bot)
     finally:
